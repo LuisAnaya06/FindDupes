@@ -1,0 +1,10 @@
+customtkinter>=5.2.2
+send2trash>=1.8.3
+rapidfuzz>=3.6.1
+Pillow>=10.2.0
+
+# Optional: For video thumbnail generation
+# Requires Python 3.13 or lower (Python 3.14+ not yet supported)
+# Uncomment below to enable thumbnails:
+# numpy<2
+# opencv-python
