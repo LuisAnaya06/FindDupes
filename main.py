@@ -70,6 +70,7 @@ class FileComparerApp(ctk.CTk):
         # Folder listbox
         self.folder_listbox = ctk.CTkTextbox(list_frame, height=100)
         self.folder_listbox.pack(side="left", fill="both", expand=True, padx=(0, 5))
+        self.folder_listbox.configure(state="disabled")  # Make read-only by default
         
         # Buttons
         btn_frame = ctk.CTkFrame(list_frame)
@@ -197,9 +198,39 @@ class FileComparerApp(ctk.CTk):
         
     def update_folder_list(self):
         """Update the folder listbox display"""
+        self.folder_listbox.configure(state="normal")
         self.folder_listbox.delete("1.0", "end")
         for folder in self.folders:
             self.folder_listbox.insert("end", f"{folder}\n")
+        self.folder_listbox.configure(state="disabled")
+    
+    def highlight_current_folder(self, folder_path):
+        """Highlight the currently scanning folder in the listbox"""
+        if not folder_path:
+            return
+        
+        self.folder_listbox.configure(state="normal")
+        self.folder_listbox.tag_config("highlight", foreground="#00FF00", font=("Arial", 10, "bold"))
+        self.folder_listbox.tag_config("normal", foreground="white")
+        
+        # Remove all previous tags
+        self.folder_listbox.tag_remove("highlight", "1.0", "end")
+        
+        # Find and highlight the current folder
+        content = self.folder_listbox.get("1.0", "end")
+        lines = content.split("\n")
+        
+        for i, line in enumerate(lines):
+            line_start = f"{i+1}.0"
+            line_end = f"{i+1}.end"
+            
+            if folder_path in line:
+                self.folder_listbox.tag_add("highlight", line_start, line_end)
+            else:
+                self.folder_listbox.tag_add("normal", line_start, line_end)
+        
+        self.folder_listbox.configure(state="disabled")
+        self.update_idletasks()
             
     def update_threshold(self, value):
         """Update similarity threshold"""
@@ -214,6 +245,17 @@ class FileComparerApp(ctk.CTk):
         
     def update_progress(self, current, total, message):
         """Update progress bar and label"""
+        # Extract folder path if in message
+        if "Scanning:" in message:
+            folder_path = message.split("Scanning: ")[1] if "Scanning: " in message else None
+            if folder_path:
+                self.highlight_current_folder(folder_path)
+        elif message == "Analysis complete!" or "stopped" in message.lower():
+            # Remove highlighting when done
+            self.folder_listbox.configure(state="normal")
+            self.folder_listbox.tag_remove("highlight", "1.0", "end")
+            self.folder_listbox.configure(state="disabled")
+        
         self.progress_label.configure(text=message)
         if total:
             self.progress_bar.set(current / total)
@@ -221,6 +263,7 @@ class FileComparerApp(ctk.CTk):
             self.progress_bar.set(0.5)  # Indeterminate
         self.update_idletasks()
         
+
     def find_exact_duplicates(self):
         """Find exact duplicates in selected folders"""
         if not self.folders:

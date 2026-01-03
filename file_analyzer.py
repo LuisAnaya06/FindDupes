@@ -205,9 +205,13 @@ class FileAnalyzer:
         """
         all_files = []
         
-        for folder in folders:
+        for folder_idx, folder in enumerate(folders):
             if not os.path.exists(folder):
                 continue
+            
+            # Report current folder being scanned
+            if progress_callback:
+                progress_callback(folder_idx, len(folders), f"Scanning: {folder}")
                 
             for root, dirs, files in os.walk(folder):
                 # Check if user requested stop
