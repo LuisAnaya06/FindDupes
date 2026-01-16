@@ -1,6 +1,32 @@
 """
+================================================================================
+FindDupes - Duplicate File Analyzer
+================================================================================
+
+AI-GENERATED CODE NOTICE:
+This application was developed with assistance from GitHub Copilot and Claude AI.
+The core architecture, algorithms, and UI implementation were generated through
+AI-assisted development and refined through iterative improvements.
+
+Author: Luis Anaya
+Repository: https://github.com/[username]/FindDupes
+License: [Your chosen license]
+Last Updated: January 2026
+
+================================================================================
+
 File Comparer - Duplicate File Analyzer with AI-powered matching
 Main GUI Application using CustomTkinter
+
+Features:
+- Exact duplicate detection using SHA-256 hashing with multiprocessing
+- Fuzzy similarity matching using RapidFuzz algorithms
+- Paginated results display for handling large datasets
+- Video thumbnail generation with OpenCV
+- Customizable filename normalization patterns
+- Safe file deletion to system trash
+- Save/load analysis results to JSON
+
 """
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
@@ -35,6 +61,16 @@ class FileComparerApp(ctk.CTk):
         self.selected_for_deletion = set()
         self.stop_requested = False
         self.sort_by = "size"  # Default sort by size
+        self.generate_thumbnails = True  # Default to enabled
+        self.current_scanning_folder = None  # Track currently scanning folder
+        self.thumbnail_widgets = {}  # Map file paths to thumbnail label widgets
+        self.thumbnail_images = {}  # Persistent cache of CTkImage objects to prevent GC
+        
+        # Pagination state
+        self.current_page = 0
+        self.groups_per_page = 50
+        self.current_result_type = None
+        self.current_sorted_groups = []
         
         # Create UI
         self.create_ui()
@@ -67,18 +103,15 @@ class FileComparerApp(ctk.CTk):
         list_frame = ctk.CTkFrame(folder_frame)
         list_frame.pack(fill="x", padx=10, pady=5)
         
-        # Folder listbox
-        self.folder_listbox = ctk.CTkTextbox(list_frame, height=100)
-        self.folder_listbox.pack(side="left", fill="both", expand=True, padx=(0, 5))
-        self.folder_listbox.configure(state="disabled")  # Make read-only by default
+        # Folder listbox - scrollable frame for individual folder rows
+        self.folder_scroll = ctk.CTkScrollableFrame(list_frame, height=100)
+        self.folder_scroll.pack(side="left", fill="both", expand=True, padx=(0, 5))
         
         # Buttons
         btn_frame = ctk.CTkFrame(list_frame)
         btn_frame.pack(side="right", fill="y")
         
         ctk.CTkButton(btn_frame, text="Add Folder", command=self.add_folder,
-                     width=120).pack(pady=2)
-        ctk.CTkButton(btn_frame, text="Remove Selected", command=self.remove_folder,
                      width=120).pack(pady=2)
         ctk.CTkButton(btn_frame, text="Clear All", command=self.clear_folders,
                      width=120).pack(pady=2)
@@ -120,6 +153,13 @@ class FileComparerApp(ctk.CTk):
         
         self.threshold_label = ctk.CTkLabel(threshold_frame, text="80%", width=40)
         self.threshold_label.pack(side="left")
+        
+        # Thumbnail checkbox
+        self.thumbnail_var = ctk.BooleanVar(value=True)
+        self.thumbnail_checkbox = ctk.CTkCheckBox(left_frame, text="Thumbnails", 
+                                                  variable=self.thumbnail_var,
+                                                  command=self.toggle_thumbnails)
+        self.thumbnail_checkbox.pack(side="left", padx=10)
         
         # Right side: File operations
         right_frame = ctk.CTkFrame(control_frame)
@@ -171,6 +211,31 @@ class FileComparerApp(ctk.CTk):
                      fg_color="red", hover_color="darkred",
                      font=("Arial", 12, "bold")).pack(side="right", padx=10)
         
+        # Pagination controls
+        pagination_frame = ctk.CTkFrame(results_frame)
+        pagination_frame.pack(fill="x", padx=5, pady=(0, 5))
+        
+        self.page_label = ctk.CTkLabel(pagination_frame, text="Page 1 of 1 (0 groups)", 
+                                       font=("Arial", 11))
+        self.page_label.pack(side="left", padx=10)
+        
+        self.prev_button = ctk.CTkButton(pagination_frame, text="◀ Previous", 
+                                         command=self.previous_page, width=100)
+        self.prev_button.pack(side="left", padx=5)
+        
+        self.next_button = ctk.CTkButton(pagination_frame, text="Next ▶", 
+                                         command=self.next_page, width=100)
+        self.next_button.pack(side="left", padx=5)
+        
+        # Jump to page
+        ctk.CTkLabel(pagination_frame, text="Jump to page:").pack(side="left", padx=(20, 5))
+        self.page_entry = ctk.CTkEntry(pagination_frame, width=60)
+        self.page_entry.pack(side="left", padx=5)
+        self.page_entry.bind("<Return>", lambda e: self.jump_to_page())
+        
+        ctk.CTkButton(pagination_frame, text="Go", width=50,
+                     command=self.jump_to_page).pack(side="left", padx=5)
+        
         # Results display with scrollbar
         self.results_scroll = ctk.CTkScrollableFrame(results_frame)
         self.results_scroll.pack(fill="both", expand=True, padx=5, pady=5)
@@ -184,52 +249,74 @@ class FileComparerApp(ctk.CTk):
             if folder not in self.folders:
                 self.folders.append(folder)
                 self.update_folder_list()
+    
+    def remove_folder(self, folder_path):
+        """Remove specific folder from list"""
+        if folder_path in self.folders:
+            self.folders.remove(folder_path)
+            self.update_folder_list()
             
-    def remove_folder(self):
-        """Remove selected folder from list"""
-        # Simple implementation: clear selection and re-select
-        self.folders = []
-        self.folder_listbox.delete("1.0", "end")
-        
     def clear_folders(self):
         """Clear all folders"""
         self.folders = []
         self.update_folder_list()
         
     def update_folder_list(self):
-        """Update the folder listbox display"""
-        self.folder_listbox.configure(state="normal")
-        self.folder_listbox.delete("1.0", "end")
+        """Update the folder listbox display with individual remove buttons"""
+        # Clear existing widgets
+        for widget in self.folder_scroll.winfo_children():
+            widget.destroy()
+        
+        # Add each folder with its own remove button
         for folder in self.folders:
-            self.folder_listbox.insert("end", f"{folder}\n")
-        self.folder_listbox.configure(state="disabled")
+            folder_row = ctk.CTkFrame(self.folder_scroll)
+            folder_row.pack(fill="x", padx=2, pady=2)
+            
+            # Folder path label - highlight if currently scanning
+            normalized_folder = os.path.normpath(folder)
+            normalized_scanning = os.path.normpath(self.current_scanning_folder) if self.current_scanning_folder else None
+            is_scanning = (normalized_scanning and normalized_folder == normalized_scanning)
+            
+            text_color = "#00FF00" if is_scanning else "white"
+            font_style = ("Arial", 10, "bold") if is_scanning else ("Arial", 10, "normal")
+            
+            ctk.CTkLabel(folder_row, text=folder, anchor="w",
+                        text_color=text_color, font=font_style).pack(
+                            side="left", fill="x", expand=True, padx=5)
+            
+            # Remove button for this specific folder
+            ctk.CTkButton(folder_row, text="✕", width=30, height=24,
+                         command=lambda f=folder: self.remove_folder(f),
+                         fg_color="red", hover_color="darkred").pack(side="right", padx=2)
     
     def highlight_current_folder(self, folder_path):
         """Highlight the currently scanning folder in the listbox"""
+        self.current_scanning_folder = folder_path
+        
         if not folder_path:
             return
         
-        self.folder_listbox.configure(state="normal")
-        self.folder_listbox.tag_config("highlight", foreground="#00FF00", font=("Arial", 10, "bold"))
-        self.folder_listbox.tag_config("normal", foreground="white")
+        # Normalize the folder path for comparison
+        normalized_scan_path = os.path.normpath(folder_path)
         
-        # Remove all previous tags
-        self.folder_listbox.tag_remove("highlight", "1.0", "end")
+        # Find and highlight the folder row
+        for widget in self.folder_scroll.winfo_children():
+            if isinstance(widget, ctk.CTkFrame):
+                # Get the label widget (first child)
+                for child in widget.winfo_children():
+                    if isinstance(child, ctk.CTkLabel):
+                        label_text = child.cget("text")
+                        normalized_label = os.path.normpath(label_text)
+                        
+                        # Compare normalized paths
+                        if normalized_scan_path == normalized_label or normalized_scan_path in normalized_label:
+                            # Highlight this folder
+                            child.configure(text_color="#00FF00", font=("Arial", 10, "bold"))
+                        else:
+                            # Normal color
+                            child.configure(text_color="white", font=("Arial", 10, "normal"))
+                        break
         
-        # Find and highlight the current folder
-        content = self.folder_listbox.get("1.0", "end")
-        lines = content.split("\n")
-        
-        for i, line in enumerate(lines):
-            line_start = f"{i+1}.0"
-            line_end = f"{i+1}.end"
-            
-            if folder_path in line:
-                self.folder_listbox.tag_add("highlight", line_start, line_end)
-            else:
-                self.folder_listbox.tag_add("normal", line_start, line_end)
-        
-        self.folder_listbox.configure(state="disabled")
         self.update_idletasks()
             
     def update_threshold(self, value):
@@ -242,26 +329,51 @@ class FileComparerApp(ctk.CTk):
         self.stop_requested = True
         self.progress_label.configure(text="Stopping...")
         self.stop_button.configure(state="disabled")
+    
+    def toggle_thumbnails(self):
+        """Toggle thumbnail generation"""
+        self.generate_thumbnails = self.thumbnail_var.get()
         
     def update_progress(self, current, total, message):
         """Update progress bar and label"""
-        # Extract folder path if in message
-        if "Scanning:" in message:
-            folder_path = message.split("Scanning: ")[1] if "Scanning: " in message else None
-            if folder_path:
-                self.highlight_current_folder(folder_path)
-        elif message == "Analysis complete!" or "stopped" in message.lower():
-            # Remove highlighting when done
-            self.folder_listbox.configure(state="normal")
-            self.folder_listbox.tag_remove("highlight", "1.0", "end")
-            self.folder_listbox.configure(state="disabled")
-        
-        self.progress_label.configure(text=message)
-        if total:
-            self.progress_bar.set(current / total)
-        else:
-            self.progress_bar.set(0.5)  # Indeterminate
-        self.update_idletasks()
+        # Run UI updates on the main thread to avoid Tkinter callback exceptions
+        def _do_update():
+            try:
+                # Extract folder path if in message and highlight
+                if isinstance(message, str) and "Scanning:" in message:
+                    folder_path = message.split("Scanning: ")[1] if "Scanning: " in message else None
+                    if folder_path:
+                        self.highlight_current_folder(folder_path)
+                elif isinstance(message, str) and (message == "Analysis complete!" or "stopped" in message.lower()):
+                    # Clear scanning folder and remove highlighting
+                    self.current_scanning_folder = None
+                    for widget in self.folder_scroll.winfo_children():
+                        if isinstance(widget, ctk.CTkFrame):
+                            for child in widget.winfo_children():
+                                if isinstance(child, ctk.CTkLabel):
+                                    child.configure(text_color="white", font=("Arial", 10, "normal"))
+                                    break
+
+                # Update progress label and bar
+                self.progress_label.configure(text=message)
+                if total and total > 0:
+                    try:
+                        self.progress_bar.set(max(0.0, min(1.0, float(current) / float(total))))
+                    except Exception:
+                        self.progress_bar.set(0.0)
+                else:
+                    self.progress_bar.set(0.5)  # Indeterminate
+
+                self.update_idletasks()
+            except Exception:
+                # Swallow UI exceptions to avoid crashing background threads
+                pass
+
+        try:
+            self.after(0, _do_update)
+        except Exception:
+            # Fallback: attempt direct update if scheduling fails
+            _do_update()
         
 
     def find_exact_duplicates(self):
@@ -372,18 +484,10 @@ class FileComparerApp(ctk.CTk):
     
     def on_sort_changed(self, choice):
         """Handle sort dropdown change"""
-        # Determine current result type based on which list has data
-        if self.exact_duplicates:
-            result_type = "Exact"
-            groups = self.exact_duplicates
-        elif self.similar_files:
-            result_type = "Similar"
-            groups = self.similar_files
-        else:
-            return
-        
-        # Re-display with new sort
-        self.display_results(groups, result_type)
+        # Re-sort and re-render current page
+        if self.current_sorted_groups:
+            self.current_sorted_groups = self.sort_groups(self.current_sorted_groups, self.current_result_type)
+            self._render_current_page(regenerate_thumbnails=False)
     
     def sort_groups(self, duplicate_groups, result_type):
         """Sort duplicate groups based on current sort setting"""
@@ -416,32 +520,172 @@ class FileComparerApp(ctk.CTk):
         
         return sorted_groups
         
-    def display_results(self, duplicate_groups, result_type):
+    def display_results(self, duplicate_groups, result_type, regenerate_thumbnails=True):
         """Display duplicate groups in the results section"""
-        # Clear previous results
+        # Store results and reset to first page
+        self.current_sorted_groups = self.sort_groups(duplicate_groups, result_type)
+        self.current_result_type = result_type
+        self.current_page = 0
+        
+        # Render first page
+        self._render_current_page(regenerate_thumbnails)
+    
+    def _render_current_page(self, regenerate_thumbnails=True):
+        """Render only the current page of results"""
+        # Clear previous display
         for widget in self.results_scroll.winfo_children():
             widget.destroy()
         
         self.selected_for_deletion.clear()
+        self.thumbnail_widgets.clear()
         
-        if not duplicate_groups:
+        if not self.current_sorted_groups:
             ctk.CTkLabel(self.results_scroll, 
-                        text=f"No {result_type.lower()} duplicates found!",
+                        text=f"No {self.current_result_type.lower()} duplicates found!",
                         font=("Arial", 14)).pack(pady=20)
             self.stats_label.configure(text="No duplicates found")
+            self.page_label.configure(text="Page 0 of 0 (0 groups)")
+            self.prev_button.configure(state="disabled")
+            self.next_button.configure(state="disabled")
             return
         
-        # Sort groups
-        sorted_groups = self.sort_groups(duplicate_groups, result_type)
+        # Calculate pagination
+        total_groups = len(self.current_sorted_groups)
+        total_pages = (total_groups + self.groups_per_page - 1) // self.groups_per_page
+        start_idx = self.current_page * self.groups_per_page
+        end_idx = min(start_idx + self.groups_per_page, total_groups)
+        page_groups = self.current_sorted_groups[start_idx:end_idx]
         
         # Update stats
-        total_files = sum(len(group) for group in sorted_groups)
+        total_files = sum(len(group) for group in self.current_sorted_groups)
+        page_files = sum(len(group) for group in page_groups)
         self.stats_label.configure(
-            text=f"{len(sorted_groups)} groups, {total_files} files")
+            text=f"{total_groups} groups, {total_files} files total | Showing {len(page_groups)} groups, {page_files} files")
         
-        # Display each group
-        for idx, group in enumerate(sorted_groups, 1):
-            self.create_group_display(group, idx, result_type)
+        # Update pagination controls
+        self.page_label.configure(
+            text=f"Page {self.current_page + 1} of {total_pages} ({total_groups} groups)")
+        self.prev_button.configure(state="normal" if self.current_page > 0 else "disabled")
+        self.next_button.configure(state="normal" if self.current_page < total_pages - 1 else "disabled")
+        
+        # Render groups on current page
+        for idx, group in enumerate(page_groups):
+            actual_group_num = start_idx + idx + 1
+            self.create_group_display(group, actual_group_num, self.current_result_type)
+        
+        # Generate thumbnails for current page
+        # Always generate for files that don't have thumbnails yet
+        # Only skip if regenerate_thumbnails is False AND all thumbnails already exist
+        if self.generate_thumbnails:
+            files_needing_thumbnails = []
+            for group in page_groups:
+                for file_info in group:
+                    if not file_info.get('thumbnail') or regenerate_thumbnails:
+                        files_needing_thumbnails.append(file_info)
+            
+            if files_needing_thumbnails:
+                self.generate_thumbnails_async_for_files(files_needing_thumbnails)
+        
+        self.progress_label.configure(text="Ready")
+        self.progress_bar.set(0)
+    
+    def previous_page(self):
+        """Navigate to previous page"""
+        if self.current_page > 0:
+            self.current_page -= 1
+            self._render_current_page(regenerate_thumbnails=False)
+    
+    def next_page(self):
+        """Navigate to next page"""
+        total_pages = (len(self.current_sorted_groups) + self.groups_per_page - 1) // self.groups_per_page
+        if self.current_page < total_pages - 1:
+            self.current_page += 1
+            self._render_current_page(regenerate_thumbnails=False)
+    
+    def jump_to_page(self):
+        """Jump to specific page number"""
+        try:
+            page_num = int(self.page_entry.get())
+            total_pages = (len(self.current_sorted_groups) + self.groups_per_page - 1) // self.groups_per_page
+            
+            if 1 <= page_num <= total_pages:
+                self.current_page = page_num - 1
+                self._render_current_page(regenerate_thumbnails=False)
+                self.page_entry.delete(0, 'end')
+            else:
+                messagebox.showwarning("Invalid Page", f"Please enter a page number between 1 and {total_pages}")
+        except ValueError:
+            messagebox.showwarning("Invalid Input", "Please enter a valid page number")
+    
+    def load_thumbnail(self, file_info, thumb_label):
+        """Load and display thumbnail image"""
+        try:
+            file_path = file_info['path']
+            
+            # Check if image already cached
+            if file_path in self.thumbnail_images:
+                photo = self.thumbnail_images[file_path]
+                thumb_label.configure(image=photo, text="")
+                return
+            
+            # Load and create new CTkImage
+            thumb_image = Image.open(file_info['thumbnail'])
+            thumb_image.thumbnail((120, 80), Image.Resampling.LANCZOS)
+            photo = ctk.CTkImage(light_image=thumb_image, dark_image=thumb_image, size=(120, 80))
+            
+            # Store in persistent cache to prevent garbage collection
+            self.thumbnail_images[file_path] = photo
+            
+            thumb_label.configure(image=photo, text="")
+        except Exception:
+            pass
+    
+    def generate_thumbnails_async(self, groups):
+        """Generate thumbnails in background thread for groups"""
+        files_to_process = []
+        for group in groups:
+            for file_info in group:
+                if not file_info.get('thumbnail'):
+                    files_to_process.append(file_info)
+        
+        if files_to_process:
+            self.generate_thumbnails_async_for_files(files_to_process)
+    
+    def generate_thumbnails_async_for_files(self, files_to_process):
+        """Generate thumbnails in background thread for specific files"""
+        def task():
+            if not files_to_process:
+                self.after(0, lambda: self.progress_label.configure(text="Ready"))
+                return
+            
+            total = len(files_to_process)
+            for idx, file_info in enumerate(files_to_process, 1):
+                # Generate thumbnail
+                thumb_path = self.analyzer.get_video_thumbnail(file_info['path'])
+                file_info['thumbnail'] = thumb_path
+                
+                # Update UI in main thread
+                if thumb_path and os.path.exists(thumb_path):
+                    self.after(0, lambda fi=file_info: self.update_thumbnail_in_ui(fi))
+                
+                # Update progress
+                self.after(0, lambda i=idx, t=total: 
+                          self.update_progress(i, t, f"Generating thumbnails... {i}/{t}"))
+            
+            # Clear progress when done
+            self.after(0, lambda: self.progress_label.configure(text="Ready"))
+            self.after(0, lambda: self.progress_bar.set(0))
+        
+        # Run in background thread
+        thread = threading.Thread(target=task, daemon=True)
+        thread.start()
+    
+    def update_thumbnail_in_ui(self, file_info):
+        """Update thumbnail in UI for a specific file"""
+        # Get the thumbnail widget for this file
+        thumb_label = self.thumbnail_widgets.get(file_info['path'])
+        if thumb_label and thumb_label.winfo_exists():
+            self.load_thumbnail(file_info, thumb_label)
             
     def create_group_display(self, group, group_num, result_type):
         """Create display for a single duplicate group"""
@@ -488,17 +732,20 @@ class FileComparerApp(ctk.CTk):
                                        file_info['path'], var.get()))
         checkbox.pack(side="left", padx=5, pady=5)
         
-        # Thumbnail
-        if file_info.get('thumbnail') and os.path.exists(file_info['thumbnail']):
-            try:
-                thumb_image = Image.open(file_info['thumbnail'])
-                thumb_image.thumbnail((120, 80), Image.Resampling.LANCZOS)
-                photo = ctk.CTkImage(light_image=thumb_image, dark_image=thumb_image, size=(120, 80))
-                thumb_label = ctk.CTkLabel(file_frame, image=photo, text="")
-                thumb_label.image = photo  # Keep a reference
-                thumb_label.pack(side="left", padx=5, pady=5)
-            except Exception:
-                pass
+        # Thumbnail - generate on-demand if enabled
+        thumb_label = None
+        if self.generate_thumbnails:
+            # Create placeholder for thumbnail
+            thumb_label = ctk.CTkLabel(file_frame, text="⏳", width=120, height=80,
+                                      font=("Arial", 40))
+            thumb_label.pack(side="left", padx=5, pady=5)
+            
+            # Store reference for async updates
+            self.thumbnail_widgets[file_info['path']] = thumb_label
+            
+            # Check if thumbnail already exists
+            if file_info.get('thumbnail') and os.path.exists(file_info['thumbnail']):
+                self.load_thumbnail(file_info, thumb_label)
         
         # File info
         info_frame = ctk.CTkFrame(file_frame)
@@ -534,6 +781,8 @@ class FileComparerApp(ctk.CTk):
         
     def toggle_file_selection(self, filepath, selected):
         """Toggle file selection for deletion"""
+        # Normalize path for consistent comparison
+        filepath = os.path.normpath(filepath)
         if selected:
             self.selected_for_deletion.add(filepath)
         else:
@@ -604,26 +853,56 @@ class FileComparerApp(ctk.CTk):
         else:
             messagebox.showinfo("Success", f"Successfully sent {success_count} file(s) to trash!")
         
-        # Clear selection and refresh results by removing deleted files from current results
+        # Clear selection and refresh results by removing deleted files
+        deleted_paths = set(filepath for filepath in list(self.selected_for_deletion) if filepath not in [fp for fp, _ in failed])
         self.selected_for_deletion.clear()
         
-        # Remove deleted files from results without re-scanning
+        # Remove deleted files from stored results
         if self.exact_duplicates:
             self.exact_duplicates = [
-                [f for f in group if f['path'] not in {fp for fp, _ in failed} and os.path.exists(f['path'])]
+                [f for f in group if os.path.normpath(f['path']) not in deleted_paths and os.path.exists(f['path'])]
                 for group in self.exact_duplicates
             ]
             # Remove empty groups and groups with only 1 file
             self.exact_duplicates = [g for g in self.exact_duplicates if len(g) > 1]
-            self.display_results(self.exact_duplicates, "Exact")
+            
+            # Update current display if showing exact duplicates
+            if self.current_result_type == "Exact":
+                self.current_sorted_groups = [
+                    [f for f in group if os.path.normpath(f['path']) not in deleted_paths and os.path.exists(f['path'])]
+                    for group in self.current_sorted_groups
+                ]
+                self.current_sorted_groups = [g for g in self.current_sorted_groups if len(g) > 1]
+                
+                # Stay on same page if possible, otherwise go to last page
+                total_pages = max(1, (len(self.current_sorted_groups) + self.groups_per_page - 1) // self.groups_per_page)
+                if self.current_page >= total_pages:
+                    self.current_page = max(0, total_pages - 1)
+                
+                self._render_current_page(regenerate_thumbnails=False)
+                
         elif self.similar_files:
             self.similar_files = [
-                [f for f in group if f['path'] not in {fp for fp, _ in failed} and os.path.exists(f['path'])]
+                [f for f in group if os.path.normpath(f['path']) not in deleted_paths and os.path.exists(f['path'])]
                 for group in self.similar_files
             ]
             # Remove empty groups and groups with only 1 file
             self.similar_files = [g for g in self.similar_files if len(g) > 1]
-            self.display_results(self.similar_files, "Similar")
+            
+            # Update current display if showing similar files
+            if self.current_result_type == "Similar":
+                self.current_sorted_groups = [
+                    [f for f in group if os.path.normpath(f['path']) not in deleted_paths and os.path.exists(f['path'])]
+                    for group in self.current_sorted_groups
+                ]
+                self.current_sorted_groups = [g for g in self.current_sorted_groups if len(g) > 1]
+                
+                # Stay on same page if possible, otherwise go to last page
+                total_pages = max(1, (len(self.current_sorted_groups) + self.groups_per_page - 1) // self.groups_per_page)
+                if self.current_page >= total_pages:
+                    self.current_page = max(0, total_pages - 1)
+                
+                self._render_current_page(regenerate_thumbnails=False)
             
     def save_results(self):
         """Save analysis results to file"""
@@ -632,6 +911,8 @@ class FileComparerApp(ctk.CTk):
             return
         
         filepath = filedialog.asksaveasfilename(
+            parent=self,
+            title="Save Results",
             defaultextension=".json",
             filetypes=[("JSON files", "*.json"), ("All files", "*.*")])
         
@@ -646,6 +927,8 @@ class FileComparerApp(ctk.CTk):
     def load_results(self):
         """Load analysis results from file"""
         filepath = filedialog.askopenfilename(
+            parent=self,
+            title="Load Results",
             filetypes=[("JSON files", "*.json"), ("All files", "*.*")])
         
         if filepath:
